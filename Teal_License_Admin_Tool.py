@@ -6,7 +6,7 @@ import getpass
 import datetime  # For formatting timestamps
 
 # --- Configuration for the Admin GUI ---
-LICENSE_ADMIN_API_URL = "http://127.0.0.1:5000"  # <--- Set to localhost
+LICENSE_ADMIN_API_URL = "https://teal-timesheet-licensing-api.onrender.com"  # <--- Set to localhost
 ADMIN_SECRET_KEY = "q/9^}H=W:HJ;%}t>$`YR$g1["  # <<-- UPDATE THIS!
 
 

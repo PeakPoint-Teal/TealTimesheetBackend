@@ -1,5 +1,5 @@
 {
-    "master_key": "Teal2025",
+    "master_key": "ChangeThisInProductionMasterKey",
     "total_licenses": 50,
     "activated_devices": []
 }

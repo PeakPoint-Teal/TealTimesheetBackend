@@ -1,65 +1,82 @@
-import os  # NEW: Import os module to access environment variables
-from flask import Flask, request, jsonify
-import json
+import os
 import datetime
-import secrets  # Used for initial key generation in old versions, but not for loading now
+import psycopg2
+import psycopg2.extras  # NEW: Helpful for dictionary-like results
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- Configuration for your Backend ---
-DB_FILE = 'licenses.json'
+# --- Configuration ---
+# ### --- DELETED --- ###
+# DB_FILE = 'licenses.json' - We no longer need this.
 
-# IMPORTANT: These keys are now loaded from Environment Variables for production security.
-# The second argument to .get() is a fallback for local development if the env var isn't set.
-# On your deployment server (e.g., Render), you MUST set FLASK_MASTER_KEY and FLASK_ADMIN_KEY
-# in their environment variable settings.
+# These keys are still loaded from Environment Variables, which is perfect.
 DEFAULT_MASTER_KEY = os.environ.get("FLASK_MASTER_KEY", "ChangeThisInProductionMasterKey")
 DEFAULT_TOTAL_LICENSES = 50
-
 ADMIN_SECRET_KEY = os.environ.get("FLASK_ADMIN_KEY", "ChangeThisInProductionAdminKey")
 
 
-# --- Database Functions (using JSON file as a simple database) ---
-def load_licenses():
-    if not os.path.exists(DB_FILE):
-        # Initialize with default data if file doesn't exist
-        initial_data = {
-            "master_key": DEFAULT_MASTER_KEY,
-            "total_licenses": DEFAULT_TOTAL_LICENSES,
-            "activated_devices": []  # MODIFIED: Now a list of device records
-        }
-        save_licenses(initial_data)
-        return initial_data
+# --- NEW: Database Helper Functions ---
 
-    with open(DB_FILE, 'r') as f:
-        return json.load(f)
+def get_db_connection():
+    """Establishes a connection to the database using the DATABASE_URL environment variable."""
+    conn = psycopg2.connect(os.environ['DATABASE_URL'])
+    return conn
 
 
-def save_licenses(data):
-    with open(DB_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
+def setup_database():
+    """Creates the necessary tables if they don't exist and initializes settings."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Table for storing individual license activations
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS licenses (
+            device_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            hostname TEXT,
+            activated_at TIMESTAMPTZ DEFAULT NOW(),
+            status TEXT NOT NULL DEFAULT 'active'
+        );
+    ''')
+
+    # Table for storing global settings like master key and license count
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            id INT PRIMARY KEY,
+            master_key TEXT NOT NULL,
+            total_licenses INT NOT NULL
+        );
+    ''')
+
+    # Check if settings are initialized. If not, insert the default values.
+    cur.execute("SELECT id FROM settings WHERE id = 1;")
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO settings (id, master_key, total_licenses) VALUES (%s, %s, %s);",
+            (1, DEFAULT_MASTER_KEY, DEFAULT_TOTAL_LICENSES)
+        )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("Database setup successful: Tables are ready.")
 
 
-# Ensure the licenses.json file exists and is initialized when the app starts
-licenses_data_on_startup = load_licenses()
-print(f"Backend started. Master Key: {licenses_data_on_startup['master_key']}")
-print(f"Total Licenses: {licenses_data_on_startup['total_licenses']}")
-# Calculate activated count by counting 'active' devices
-active_devices_count_on_startup = sum(
-    1 for d in licenses_data_on_startup['activated_devices'] if d.get('status') == 'active')
-print(f"Activated Devices: {active_devices_count_on_startup}")
+# ### --- DELETED --- ###
+# The `load_licenses` and `save_licenses` functions are no longer needed.
+# The `get_active_device_count` function will be replaced by a direct SQL query.
+
+# --- Run Database Setup on Startup ---
+# This ensures your tables exist every time the app starts.
+setup_database()
 
 
-# --- Helper to count active devices ---
-def get_active_device_count(licenses_data):
-    return sum(1 for d in licenses_data['activated_devices'] if d.get('status') == 'active')
+# --- API Endpoints (Now Refactored for PostgreSQL) ---
 
-
-# --- API Endpoints ---
-
-# NEW: Simple health check endpoint for Render (publicly accessible)
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Simple health check endpoint for Render's health checks and UptimeRobot."""
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
 
 
@@ -74,79 +91,88 @@ def activate_license():
     if not all([license_key, device_id, username, hostname]):
         return jsonify({"success": False, "message": "Missing data"}), 400
 
-    licenses_data = load_licenses()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    if license_key != licenses_data["master_key"]:
-        return jsonify({"success": False, "message": "Invalid license key"}), 403
+    try:
+        # Get settings from the database
+        cur.execute("SELECT master_key, total_licenses FROM settings WHERE id = 1;")
+        settings = cur.fetchone()
+        if not settings:
+            return jsonify({"success": False, "message": "Server settings not initialized."}), 500
 
-    # Check if this device_id is already in the list
-    existing_device = next((d for d in licenses_data["activated_devices"] if d['device_id'] == device_id), None)
+        if license_key != settings["master_key"]:
+            return jsonify({"success": False, "message": "Invalid license key"}), 403
 
-    if existing_device:
-        if existing_device.get('status') == 'active':
-            return jsonify({"success": True, "message": "License already active on this device"}), 200
-        else:  # Device exists but is 'inactive' or other status, reactivate it
-            current_activated_count = get_active_device_count(licenses_data)
-            if current_activated_count >= licenses_data["total_licenses"]:
-                return jsonify({"success": False,
-                                "message": "All licenses are currently in use. Please contact your administrator to acquire more licenses."}), 403
+        # Check if device already exists
+        cur.execute("SELECT * FROM licenses WHERE device_id = %s;", (device_id,))
+        existing_device = cur.fetchone()
 
-            existing_device['status'] = 'active'
-            existing_device['activated_at'] = datetime.datetime.now().isoformat()
-            existing_device['username'] = username  # Update info in case it changed
-            existing_device['hostname'] = hostname
-            save_licenses(licenses_data)
-            return jsonify({"success": True, "message": "License reactivated successfully!",
-                            "licenses_remaining": licenses_data["total_licenses"] - (current_activated_count + 1)}), 200
+        # Count currently active licenses
+        cur.execute("SELECT COUNT(*) FROM licenses WHERE status = 'active';")
+        active_count = cur.fetchone()['count']
 
-    # If device is new, activate it
-    current_activated_count = get_active_device_count(licenses_data)
-    if current_activated_count >= licenses_data["total_licenses"]:
-        return jsonify({"success": False,
-                        "message": "All licenses are currently in use. Please contact your administrator to acquire more licenses."}), 403
+        if existing_device:
+            if existing_device['status'] == 'active':
+                return jsonify({"success": True, "message": "License already active on this device"}), 200
+            else:  # Reactivating an inactive license
+                if active_count >= settings["total_licenses"]:
+                    return jsonify({"success": False, "message": "All licenses are currently in use."}), 403
 
-    # Add the new device to the list
-    licenses_data["activated_devices"].append({
-        "device_id": device_id,
-        "username": username,
-        "hostname": hostname,
-        "activated_at": datetime.datetime.now().isoformat(),
-        "status": "active"  # New: Set status to active
-    })
-    save_licenses(licenses_data)
+                cur.execute("""
+                    UPDATE licenses
+                    SET status = 'active', activated_at = NOW(), username = %s, hostname = %s
+                    WHERE device_id = %s;
+                """, (username, hostname, device_id))
+                message = "License reactivated successfully!"
+                active_count += 1
+        else:  # Activating a new device
+            if active_count >= settings["total_licenses"]:
+                return jsonify({"success": False, "message": "All licenses are currently in use."}), 403
 
-    return jsonify({
-        "success": True,
-        "message": "License activated successfully!",
-        "licenses_remaining": licenses_data["total_licenses"] - (current_activated_count + 1)
-    }), 200
+            cur.execute("""
+                INSERT INTO licenses (device_id, username, hostname, status)
+                VALUES (%s, %s, %s, 'active');
+            """, (device_id, username, hostname))
+            message = "License activated successfully!"
+            active_count += 1
+
+        conn.commit()
+        return jsonify({
+            "success": True, "message": message,
+            "licenses_remaining": settings["total_licenses"] - active_count
+        }), 200
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.route('/check_license', methods=['POST'])
 def check_license():
     data = request.get_json()
     device_id = data.get('device_id')
-
     if not device_id:
         return jsonify({"success": False, "message": "Missing device ID"}), 400
 
-    licenses_data = load_licenses()
-    # Check if device exists and is active
-    is_active = any(
-        d['device_id'] == device_id and d.get('status') == 'active' for d in licenses_data["activated_devices"])
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute("SELECT status FROM licenses WHERE device_id = %s;", (device_id,))
+        device = cur.fetchone()
 
-    if is_active:
-        return jsonify({"success": True, "message": "License active"}), 200
-    else:
-        # If device is found but inactive, or not found at all, return failure with message
-        device_found = any(d['device_id'] == device_id for d in licenses_data["activated_devices"])
-        if device_found:
+        if device and device['status'] == 'active':
+            return jsonify({"success": True, "message": "License active"}), 200
+        elif device and device['status'] != 'active':
             return jsonify({"success": False, "message": "This device's license has been deactivated."}), 403
         else:
             return jsonify({"success": False, "message": "License not found for this device."}), 403
+    finally:
+        cur.close()
+        conn.close()
 
 
-# --- Admin Endpoint (for you to manage licenses) ---
+# --- Admin Endpoints (Now Refactored for PostgreSQL) ---
 
 @app.route('/admin/set_total_licenses', methods=['POST'])
 def set_total_licenses():
@@ -160,10 +186,15 @@ def set_total_licenses():
     if not isinstance(new_total, int) or new_total < 0:
         return jsonify({"success": False, "message": "Invalid new_total_licenses"}), 400
 
-    licenses_data = load_licenses()
-    licenses_data["total_licenses"] = new_total
-    save_licenses(licenses_data)
-    return jsonify({"success": True, "message": f"Total licenses set to {new_total}"}), 200
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE settings SET total_licenses = %s WHERE id = 1;", (new_total,))
+        conn.commit()
+        return jsonify({"success": True, "message": f"Total licenses set to {new_total}"}), 200
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.route('/admin/view_status', methods=['GET'])
@@ -172,88 +203,82 @@ def view_status():
     if admin_key != ADMIN_SECRET_KEY:
         return jsonify({"success": False, "message": "Unauthorized"}), 403
 
-    licenses_data = load_licenses()
-    activated_count = get_active_device_count(licenses_data)  # Count only active devices
-    licenses_remaining = licenses_data["total_licenses"] - activated_count
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        # Get settings
+        cur.execute("SELECT total_licenses FROM settings WHERE id = 1;")
+        settings = cur.fetchone()
+        total_licenses = settings['total_licenses'] if settings else 0
 
-    # Prepare activated_devices list to send, showing status
-    # Convert list of dicts to a dict for easier consumption by GUI (keyed by device_id)
-    activated_devices_dict = {d['device_id']: d for d in licenses_data['activated_devices']}
+        # Get all devices
+        cur.execute(
+            "SELECT device_id, username, hostname, status, to_char(activated_at, 'YYYY-MM-DD HH24:MI:SS TZ') as activated_at FROM licenses;")
+        all_devices = cur.fetchall()
 
-    return jsonify({
-        "total_licenses": licenses_data["total_licenses"],
-        "activated_count": activated_count,
-        "licenses_remaining": licenses_remaining,
-        "activated_devices": activated_devices_dict
-    }), 200
+        # Process data
+        activated_devices_dict = {d['device_id']: d for d in all_devices}
+        active_count = sum(1 for d in all_devices if d['status'] == 'active')
+
+        return jsonify({
+            "total_licenses": total_licenses,
+            "activated_count": active_count,
+            "licenses_remaining": total_licenses - active_count,
+            "activated_devices": activated_devices_dict
+        }), 200
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_device_status(device_id, new_status, admin_key):
+    """Helper function to activate/deactivate a device."""
+    if admin_key != ADMIN_SECRET_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+    if not device_id:
+        return jsonify({"success": False, "message": "Missing device ID"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        # Check if device exists first
+        cur.execute("SELECT status FROM licenses WHERE device_id = %s;", (device_id,))
+        device = cur.fetchone()
+        if not device:
+            return jsonify({"success": False, "message": "Device not found."}), 404
+        if device['status'] == new_status:
+            return jsonify({"success": True, "message": f"Device is already {new_status}."}), 200
+
+        # If activating, check license count
+        if new_status == 'active':
+            cur.execute("SELECT COUNT(*) as count FROM licenses WHERE status = 'active';")
+            active_count = cur.fetchone()['count']
+            cur.execute("SELECT total_licenses FROM settings WHERE id = 1;")
+            total_licenses = cur.fetchone()['total_licenses']
+            if active_count >= total_licenses:
+                return jsonify({"success": False, "message": "Cannot activate: All licenses are in use."}), 403
+
+        cur.execute("UPDATE licenses SET status = %s WHERE device_id = %s;", (new_status, device_id))
+        conn.commit()
+        return jsonify({"success": True, "message": f"Device '{device_id}' status set to {new_status}."}), 200
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.route('/admin/deactivate_device', methods=['POST'])
 def deactivate_device():
     data = request.get_json()
-    device_id = data.get('device_id')
-    admin_key = data.get('admin_key')
-
-    if admin_key != ADMIN_SECRET_KEY:
-        return jsonify({"success": False, "message": "Unauthorized"}), 403
-
-    if not device_id:
-        return jsonify({"success": False, "message": "Missing device ID"}), 400
-
-    licenses_data = load_licenses()
-
-    device_record = next((d for d in licenses_data["activated_devices"] if d['device_id'] == device_id), None)
-
-    if not device_record:
-        return jsonify({"success": False, "message": "Device not found."}), 404
-
-    if device_record.get('status') == 'inactive':
-        return jsonify({"success": True, "message": f"Device '{device_id}' is already inactive."}), 200
-
-    device_record['status'] = 'inactive'  # Set status to inactive
-    save_licenses(licenses_data)
-
-    return jsonify({"success": True, "message": f"Device '{device_id}' deactivated successfully!"}), 200
+    return update_device_status(data.get('device_id'), 'inactive', data.get('admin_key'))
 
 
-# NEW: Admin endpoint to activate a device
 @app.route('/admin/activate_device', methods=['POST'])
 def activate_device_admin():
     data = request.get_json()
-    device_id = data.get('device_id')
-    admin_key = data.get('admin_key')
-
-    if admin_key != ADMIN_SECRET_KEY:
-        return jsonify({"success": False, "message": "Unauthorized"}), 403
-
-    if not device_id:
-        return jsonify({"success": False, "message": "Missing device ID"}), 400
-
-    licenses_data = load_licenses()
-
-    device_record = next((d for d in licenses_data["activated_devices"] if d['device_id'] == device_id), None)
-
-    if not device_record:
-        return jsonify({"success": False, "message": "Device not found."}), 404
-
-    if device_record.get('status') == 'active':
-        return jsonify({"success": True, "message": f"Device '{device_id}' is already active."}), 200
-
-    # Ensure there's an available license before activating via admin panel
-    current_activated_count = get_active_device_count(licenses_data)
-    if current_activated_count >= licenses_data["total_licenses"]:
-        return jsonify({"success": False, "message": "Cannot activate device: All licenses are currently in use."}), 403
-
-    device_record['status'] = 'active'  # Set status to active
-    save_licenses(licenses_data)
-
-    return jsonify({"success": True, "message": f"Device '{device_id}' activated successfully by admin!"}), 200
+    return update_device_status(data.get('device_id'), 'active', data.get('admin_key'))
 
 
+# --- Main Execution ---
 if __name__ == '__main__':
-    # IMPORTANT: DO NOT USE debug=True in a production environment.
-    # It enables a debugger that allows arbitrary code execution.
-    # For local testing, ensure you set the FLASK_MASTER_KEY and FLASK_ADMIN_KEY
-    # environment variables in your terminal before running.
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port)
