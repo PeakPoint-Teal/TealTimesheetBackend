@@ -1,6 +1,6 @@
+import os  # NEW: Import os module to access environment variables
 from flask import Flask, request, jsonify
 import json
-import os
 import datetime
 import secrets  # Used for initial key generation in old versions, but not for loading now
 
@@ -247,4 +247,7 @@ def activate_device_admin():
 if __name__ == '__main__':
     # IMPORTANT: DO NOT USE debug=True in a production environment.
     # It enables a debugger that allows arbitrary code execution.
-    app.run(host='0.0.0.0', port=5000, debug=False)  # Ensure debug=False for production prep
+    # For local testing, ensure you set the FLASK_MASTER_KEY and FLASK_ADMIN_KEY
+    # environment variables in your terminal before running.
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
