@@ -57,6 +57,12 @@ def get_active_device_count(licenses_data):
 
 # --- API Endpoints ---
 
+# NEW: Simple health check endpoint for Render (publicly accessible)
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok", "message": "Backend is running"}), 200
+
+
 @app.route('/activate_license', methods=['POST'])
 def activate_license():
     data = request.get_json()
