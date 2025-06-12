@@ -7,24 +7,34 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- Configuration ---
+# Environment variables are the source of truth now.
 DEFAULT_MASTER_KEY = os.environ.get("FLASK_MASTER_KEY", "FallbackMasterKeyForLocalDev")
 DEFAULT_TOTAL_LICENSES = 50
 ADMIN_SECRET_KEY = os.environ.get("FLASK_ADMIN_KEY", "FallbackAdminKeyForLocalDev")
 
 
-# --- Database Helper Functions ---
+# --- NEW: Database Helper Functions ---
+
 def get_db_connection():
-    """Establishes a connection to the database."""
+    """
+    Establishes a connection to the database.
+    Includes robust error handling for the DATABASE_URL environment variable.
+    """
     db_url = os.environ.get('DATABASE_URL')
     if not db_url:
-        raise ValueError("FATAL ERROR: DATABASE_URL environment variable is not set.")
+        # This will now raise a clear error in your logs instead of a generic KeyError
+        raise ValueError(
+            "FATAL ERROR: DATABASE_URL environment variable is not set. Please check service configuration on Render.")
     conn = psycopg2.connect(db_url)
     return conn
+
 
 def setup_database():
     """Creates the necessary tables if they don't exist and initializes settings."""
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # Table for storing individual license activations
     cur.execute('''
         CREATE TABLE IF NOT EXISTS licenses (
             device_id TEXT PRIMARY KEY,
@@ -34,6 +44,8 @@ def setup_database():
             status TEXT NOT NULL DEFAULT 'active'
         );
     ''')
+
+    # Table for storing global settings like master key and license count
     cur.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             id INT PRIMARY KEY,
@@ -41,24 +53,32 @@ def setup_database():
             total_licenses INT NOT NULL
         );
     ''')
+
+    # Initialize settings if the table is empty
     cur.execute("SELECT id FROM settings WHERE id = 1;")
     if cur.fetchone() is None:
         cur.execute(
             "INSERT INTO settings (id, master_key, total_licenses) VALUES (%s, %s, %s);",
             (1, DEFAULT_MASTER_KEY, DEFAULT_TOTAL_LICENSES)
         )
+
     conn.commit()
     cur.close()
     conn.close()
     print("Database setup successful: Tables are ready.")
 
+
 # --- Run Database Setup on Startup ---
 setup_database()
 
+
 # --- API Endpoints ---
+
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Simple health check endpoint."""
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
+
 
 @app.route('/activate_license', methods=['POST'])
 def activate_license():
@@ -73,14 +93,19 @@ def activate_license():
 
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
     try:
         cur.execute("SELECT master_key, total_licenses FROM settings WHERE id = 1;")
         settings = cur.fetchone()
+        if not settings:
+            return jsonify({"success": False, "message": "Server settings not initialized."}), 500
+
         if license_key != settings["master_key"]:
             return jsonify({"success": False, "message": "Invalid license key"}), 403
 
         cur.execute("SELECT * FROM licenses WHERE device_id = %s;", (device_id,))
         existing_device = cur.fetchone()
+
         cur.execute("SELECT COUNT(*) FROM licenses WHERE status = 'active';")
         active_count = cur.fetchone()['count']
 
@@ -90,23 +115,33 @@ def activate_license():
             else:
                 if active_count >= settings["total_licenses"]:
                     return jsonify({"success": False, "message": "All licenses are currently in use."}), 403
-                cur.execute("UPDATE licenses SET status = 'active', activated_at = NOW(), username = %s, hostname = %s WHERE device_id = %s;", (username, hostname, device_id))
+
+                cur.execute(
+                    "UPDATE licenses SET status = 'active', activated_at = NOW(), username = %s, hostname = %s WHERE device_id = %s;",
+                    (username, hostname, device_id))
                 message = "License reactivated successfully!"
                 active_count += 1
         else:
             if active_count >= settings["total_licenses"]:
                 return jsonify({"success": False, "message": "All licenses are currently in use."}), 403
-            cur.execute("INSERT INTO licenses (device_id, username, hostname, status) VALUES (%s, %s, %s, 'active');", (device_id, username, hostname))
+
+            cur.execute("INSERT INTO licenses (device_id, username, hostname, status) VALUES (%s, %s, %s, 'active');",
+                        (device_id, username, hostname))
             message = "License activated successfully!"
             active_count += 1
 
         conn.commit()
-        return jsonify({"success": True, "message": message, "licenses_remaining": settings["total_licenses"] - active_count}), 200
+        return jsonify({
+            "success": True, "message": message,
+            "licenses_remaining": settings["total_licenses"] - active_count
+        }), 200
     except Exception as e:
-        return jsonify({"success": False, "message": f"An internal server error occurred: {e}"}), 500
+        print(f"Error in activate_license: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
     finally:
         cur.close()
         conn.close()
+
 
 @app.route('/check_license', methods=['POST'])
 def check_license():
@@ -114,23 +149,63 @@ def check_license():
     device_id = data.get('device_id')
     if not device_id:
         return jsonify({"success": False, "message": "Missing device ID"}), 400
+
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute("SELECT status FROM licenses WHERE device_id = %s;", (device_id,))
         device = cur.fetchone()
+
         if device and device['status'] == 'active':
             return jsonify({"success": True, "message": "License active"}), 200
         elif device:
             return jsonify({"success": False, "message": "This device's license has been deactivated."}), 403
         else:
             return jsonify({"success": False, "message": "License not found for this device."}), 403
+    except Exception as e:
+        print(f"Error in check_license: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
     finally:
         cur.close()
         conn.close()
 
-# ... (Your Admin endpoints will also need to be updated to use the database) ...
-# This is an example for view_status
+
+# ... (The rest of your Admin endpoints remain largely the same, but should also use try/except/finally blocks)
+def update_device_status(device_id, new_status, admin_key):
+    if admin_key != ADMIN_SECRET_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+    if not device_id:
+        return jsonify({"success": False, "message": "Missing device ID"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute("SELECT status FROM licenses WHERE device_id = %s;", (device_id,))
+        device = cur.fetchone()
+        if not device:
+            return jsonify({"success": False, "message": "Device not found."}), 404
+        if device['status'] == new_status:
+            return jsonify({"success": True, "message": f"Device is already {new_status}."}), 200
+
+        if new_status == 'active':
+            cur.execute("SELECT COUNT(*) as count FROM licenses WHERE status = 'active';")
+            active_count = cur.fetchone()['count']
+            cur.execute("SELECT total_licenses FROM settings WHERE id = 1;")
+            total_licenses = cur.fetchone()['total_licenses']
+            if active_count >= total_licenses:
+                return jsonify({"success": False, "message": "Cannot activate: All licenses are in use."}), 403
+
+        cur.execute("UPDATE licenses SET status = %s WHERE device_id = %s;", (new_status, device_id))
+        conn.commit()
+        return jsonify({"success": True, "message": f"Device '{device_id}' status set to {new_status}."}), 200
+    except Exception as e:
+        print(f"Error in update_device_status: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
 @app.route('/admin/view_status', methods=['GET'])
 def view_status():
     admin_key = request.args.get('admin_key')
@@ -144,7 +219,8 @@ def view_status():
         settings = cur.fetchone()
         total_licenses = settings['total_licenses'] if settings else 0
 
-        cur.execute("SELECT device_id, username, hostname, status, to_char(activated_at, 'YYYY-MM-DD HH24:MI:SS TZ') as activated_at FROM licenses;")
+        cur.execute(
+            "SELECT device_id, username, hostname, status, to_char(activated_at, 'YYYY-MM-DD HH24:MI:SS TZ') as activated_at FROM licenses;")
         all_devices = cur.fetchall()
 
         activated_devices_dict = {d['device_id']: d for d in all_devices}
@@ -156,9 +232,49 @@ def view_status():
             "licenses_remaining": total_licenses - active_count,
             "activated_devices": activated_devices_dict
         }), 200
+    except Exception as e:
+        print(f"Error in view_status: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
     finally:
         cur.close()
         conn.close()
+
+
+@app.route('/admin/set_total_licenses', methods=['POST'])
+def set_total_licenses():
+    data = request.get_json()
+    new_total = data.get('new_total_licenses')
+    admin_key = data.get('admin_key')
+
+    if admin_key != ADMIN_SECRET_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+    if not isinstance(new_total, int) or new_total < 0:
+        return jsonify({"success": False, "message": "Invalid new_total_licenses"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE settings SET total_licenses = %s WHERE id = 1;", (new_total,))
+        conn.commit()
+        return jsonify({"success": True, "message": f"Total licenses set to {new_total}"}), 200
+    except Exception as e:
+        print(f"Error in set_total_licenses: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/admin/deactivate_device', methods=['POST'])
+def deactivate_device():
+    data = request.get_json()
+    return update_device_status(data.get('device_id'), 'inactive', data.get('admin_key'))
+
+
+@app.route('/admin/activate_device', methods=['POST'])
+def activate_device_admin():
+    data = request.get_json()
+    return update_device_status(data.get('device_id'), 'active', data.get('admin_key'))
 
 
 if __name__ == '__main__':
