@@ -11,9 +11,11 @@ app = Flask(__name__)
 DEFAULT_MASTER_KEY = os.environ.get("FLASK_MASTER_KEY", "FallbackMasterKeyForLocalDev")
 DEFAULT_TOTAL_LICENSES = 50
 ADMIN_SECRET_KEY = os.environ.get("FLASK_ADMIN_KEY", "FallbackAdminKeyForLocalDev")
+# A default download URL for new versions
+DEFAULT_DOWNLOAD_URL = "https://www.peakpointenterprise.com/download-timesheet"
 
 
-# --- NEW: Database Helper Functions ---
+# --- Database Helper Functions ---
 
 def get_db_connection():
     """
@@ -22,9 +24,7 @@ def get_db_connection():
     """
     db_url = os.environ.get('DATABASE_URL')
     if not db_url:
-        # This will now raise a clear error in your logs instead of a generic KeyError
-        raise ValueError(
-            "FATAL ERROR: DATABASE_URL environment variable is not set. Please check service configuration on Render.")
+        raise ValueError("FATAL ERROR: DATABASE_URL environment variable is not set.")
     conn = psycopg2.connect(db_url)
     return conn
 
@@ -34,7 +34,7 @@ def setup_database():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Table for storing individual license activations
+    # --- Licenses Table ---
     cur.execute('''
         CREATE TABLE IF NOT EXISTS licenses (
             device_id TEXT PRIMARY KEY,
@@ -45,12 +45,22 @@ def setup_database():
         );
     ''')
 
-    # Table for storing global settings like master key and license count
+    # --- Settings Table ---
     cur.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             id INT PRIMARY KEY,
             master_key TEXT NOT NULL,
             total_licenses INT NOT NULL
+        );
+    ''')
+
+    # --- NEW: Versions Table ---
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS versions (
+            version_number TEXT PRIMARY KEY,
+            release_date TIMESTAMPTZ DEFAULT NOW(),
+            download_url TEXT NOT NULL,
+            is_latest BOOLEAN NOT NULL DEFAULT FALSE
         );
     ''')
 
@@ -61,6 +71,16 @@ def setup_database():
             "INSERT INTO settings (id, master_key, total_licenses) VALUES (%s, %s, %s);",
             (1, DEFAULT_MASTER_KEY, DEFAULT_TOTAL_LICENSES)
         )
+        print("Initialized default settings.")
+
+    # Initialize versions if the table is empty
+    cur.execute("SELECT COUNT(*) FROM versions;")
+    if cur.fetchone()[0] == 0:
+        cur.execute(
+            "INSERT INTO versions (version_number, download_url, is_latest) VALUES (%s, %s, %s);",
+            ("3.0.1", DEFAULT_DOWNLOAD_URL, True)
+        )
+        print("Initialized with default version 3.0.1.")
 
     conn.commit()
     cur.close()
@@ -72,12 +92,35 @@ def setup_database():
 setup_database()
 
 
-# --- API Endpoints ---
+# --- Public API Endpoints ---
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Simple health check endpoint."""
     return jsonify({"status": "ok", "message": "Backend is running"}), 200
+
+
+@app.route('/app_version', methods=['GET'])
+def get_app_version():
+    """Provides the latest version info for the client from the database."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute("SELECT version_number, download_url FROM versions WHERE is_latest = TRUE LIMIT 1;")
+        latest_version = cur.fetchone()
+        if latest_version:
+            return jsonify({
+                "latest_version": latest_version["version_number"],
+                "download_url": latest_version["download_url"]
+            }), 200
+        else:
+            return jsonify({"success": False, "message": "No latest version configured."}), 404
+    except Exception as e:
+        print(f"Error in get_app_version: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.route('/activate_license', methods=['POST'])
@@ -115,7 +158,6 @@ def activate_license():
             else:
                 if active_count >= settings["total_licenses"]:
                     return jsonify({"success": False, "message": "All licenses are currently in use."}), 403
-
                 cur.execute(
                     "UPDATE licenses SET status = 'active', activated_at = NOW(), username = %s, hostname = %s WHERE device_id = %s;",
                     (username, hostname, device_id))
@@ -124,7 +166,6 @@ def activate_license():
         else:
             if active_count >= settings["total_licenses"]:
                 return jsonify({"success": False, "message": "All licenses are currently in use."}), 403
-
             cur.execute("INSERT INTO licenses (device_id, username, hostname, status) VALUES (%s, %s, %s, 'active');",
                         (device_id, username, hostname))
             message = "License activated successfully!"
@@ -170,7 +211,8 @@ def check_license():
         conn.close()
 
 
-# ... (The rest of your Admin endpoints remain largely the same, but should also use try/except/finally blocks)
+# --- Admin API Endpoints ---
+
 def update_device_status(device_id, new_status, admin_key):
     if admin_key != ADMIN_SECRET_KEY:
         return jsonify({"success": False, "message": "Unauthorized"}), 403
@@ -277,22 +319,70 @@ def activate_device_admin():
     return update_device_status(data.get('device_id'), 'active', data.get('admin_key'))
 
 
-# ... (rest of the file) ...
+# --- NEW: Version Management Admin Endpoints ---
 
-@app.route('/app_version', methods=['GET'])
-def get_app_version():
-    """Provides the latest version info for the client application."""
-    # --- IMPORTANT ---
-    # Update these values every time you release a new version.
-    latest_version_info = {
-        # Set this to the new version number you are about to build.
-        "latest_version": "3.0.1",
+@app.route('/admin/get_versions', methods=['GET'])
+def get_versions():
+    admin_key = request.args.get('admin_key')
+    if admin_key != ADMIN_SECRET_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
 
-        # This must be a public URL where users can download the installer.
-        # For example, a link from your website or a public GitHub Release.
-        "download_url": "https://www.peakpointenterprise.com/download-timesheet"
-    }
-    return jsonify(latest_version_info), 200
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT version_number, to_char(release_date, 'YYYY-MM-DD HH24:MI:SS TZ') as release_date, download_url, is_latest FROM versions ORDER BY release_date DESC;")
+        versions = cur.fetchall()
+        return jsonify({"success": True, "versions": versions}), 200
+    except Exception as e:
+        print(f"Error in get_versions: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/admin/set_latest_version', methods=['POST'])
+def set_latest_version():
+    data = request.get_json()
+    new_version = data.get('version_number')
+    download_url = data.get('download_url')
+    admin_key = data.get('admin_key')
+
+    if admin_key != ADMIN_SECRET_KEY:
+        return jsonify({"success": False, "message": "Unauthorized"}), 403
+    if not new_version or not download_url:
+        return jsonify({"success": False, "message": "Missing version_number or download_url"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Transaction: Set all other versions to not be the latest
+        cur.execute("UPDATE versions SET is_latest = FALSE;")
+
+        # Check if the new version already exists
+        cur.execute("SELECT version_number FROM versions WHERE version_number = %s;", (new_version,))
+        if cur.fetchone():
+            # If it exists, update it to be the latest
+            cur.execute(
+                "UPDATE versions SET is_latest = TRUE, download_url = %s, release_date = NOW() WHERE version_number = %s;",
+                (download_url, new_version))
+            message = f"Successfully set version {new_version} as the latest."
+        else:
+            # If it's a new version, insert it
+            cur.execute("INSERT INTO versions (version_number, download_url, is_latest) VALUES (%s, %s, TRUE);",
+                        (new_version, download_url))
+            message = f"Successfully added and set new version {new_version} as the latest."
+
+        conn.commit()
+        return jsonify({"success": True, "message": message}), 200
+    except Exception as e:
+        conn.rollback()
+        print(f"Error in set_latest_version: {e}")
+        return jsonify({"success": False, "message": "An internal server error occurred."}), 500
+    finally:
+        cur.close()
+        conn.close()
 
 
 if __name__ == '__main__':
