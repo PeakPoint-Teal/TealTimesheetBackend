@@ -286,7 +286,7 @@ def get_app_version():
     # Update these values every time you release a new version.
     latest_version_info = {
         # Set this to the new version number you are about to build.
-        "latest_version": "3.0.0",
+        "latest_version": "3.0.1",
 
         # This must be a public URL where users can download the installer.
         # For example, a link from your website or a public GitHub Release.
