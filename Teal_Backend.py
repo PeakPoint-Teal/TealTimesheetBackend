@@ -277,20 +277,24 @@ def activate_device_admin():
     return update_device_status(data.get('device_id'), 'active', data.get('admin_key'))
 
 
+# ... (rest of the file) ...
+
 @app.route('/app_version', methods=['GET'])
 def get_app_version():
-    # You will update these values whenever you release a new version
+    """Provides the latest version info for the client application."""
+    # --- IMPORTANT ---
+    # Update these values every time you release a new version.
     latest_version_info = {
-        "latest_version": "2.9.0-stable", # <-- The newest version number
-        "download_url": "https://www.peakpointenterprise.com/download" # <-- Your download page
+        # Set this to the new version number you are about to build.
+        "latest_version": "3.0.0",
+
+        # This must be a public URL where users can download the installer.
+        # For example, a link from your website or a public GitHub Release.
+        "download_url": "https://www.peakpointenterprise.com/download-timesheet"
     }
     return jsonify(latest_version_info), 200
-
-
-
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-
